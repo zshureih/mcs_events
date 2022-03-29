@@ -99,10 +99,9 @@ def get_dataset():
         scene_df = master_df.iloc[idx]
         objects = scene_df['obj_id'].unique()
         for obj_id in objects:
-            #TODO: Add more implausible paths (shunted or suddenly stopping objects)
             # get the whole track
             track_idx = np.where(scene_df['obj_id'] == obj_id)
-            track = scene_df[["3d_pos_x","3d_pos_y","3d_pos_z", "timestep"]].iloc[track_idx].to_numpy().astype(np.float64)
+            track = scene_df[["3d_pos_x","3d_pos_y","3d_pos_z","timestep"]].iloc[track_idx].to_numpy().astype(np.float64)
 
             # get the packed sequence of positions
             track = torch.tensor(track).unsqueeze(0)
@@ -125,11 +124,12 @@ class MCS_Sequence_Dataset(Dataset):
         
         # get all our data
         X, L, S = get_dataset()
-        self.data = torch.index_select(X[:, :, :-1], -1, torch.LongTensor([2, 1, 0]))
+        # swap the y and z axis
+        self.data = torch.index_select(X[:, :, :-1], -1, torch.LongTensor([0, 2, 1]))
         self.lengths = L
         self.scene_names = S
         self.max_length = X.shape[1]
-
+ 
         self.timesteps = X[:, :, -1]
     
     def __getitem__(self, index):
@@ -137,8 +137,6 @@ class MCS_Sequence_Dataset(Dataset):
         
         packed_X = pack_padded_sequence(row.unsqueeze(1), [sum(self.lengths[index])], batch_first=False, enforce_sorted=False)
         packed_X = packed_X.data
-        # subtract the initial position of the trajectory from each position in trajectory to delta-ize
-        packed_X = torch.sub(packed_X, packed_X[0, :].repeat((packed_X.size(0)),1))
         timesteps = pack_padded_sequence(self.timesteps[index].unsqueeze(1), [sum(self.lengths[index])], batch_first=False, enforce_sorted=False)
         
         return packed_X, timesteps.data.long(), self.scene_names[index], self.lengths[index]
@@ -150,38 +148,41 @@ class MCS_Sequence_Dataset(Dataset):
 def get_gt(scene_name):
     return pd.read_csv(f"data/{scene_name}/gt.txt", header=None, names=features)
 
-def mask_input(src, timesteps):
+def mask_input(src, timesteps, min_k=5):
     src = src.permute(1, 0, 2).cuda()
     target = src.detach().clone() # make a copy of our source and label it as the target
 
     # now let's mask the input
-    # randomly select 15% of samples
-    perm = torch.randperm(src.size(0), dtype=torch.int64)
-    selected_idx = perm[:int(src.size(0) * 0.15)]
-
-    # timesteps are shuffled, get 80/10/10 split
-    num_selected = int(src.size(0) * 0.15)
-    num_masked = int(num_selected * 0.8)
-    num_randomized = num_masked + int(num_selected * 0.1)
-
-    masked_idx = selected_idx[:num_masked].cuda()
-    randomized_idx = selected_idx[num_masked:num_randomized]
+    # randomly select a k frame window to mask 
+    init_index = np.random.randint(0, src.size(0) - min_k)
+    masked_idx = range(init_index, init_index + min_k)
 
     # mask idx 
     for t in masked_idx:
-        src[t.item(), :, :] = torch.zeros((1, 3), dtype=torch.float64).cuda()
+        src[t, :, :] = torch.full((1, 3), -99, dtype=torch.float64).cuda()
 
-    for t in randomized_idx:
-        src[t.item(), :, :] += torch.randn((1, 3), dtype=torch.float64).cuda()
+    return src, target, masked_idx
+
+def get_deltas(source):
+    # subtract the initial position of the trajectory from each position in trajectory to delta-ize
+    comp_x = torch.cat((source[:, 0, :].unsqueeze(1), source[:, :-1, :]), axis=1)
+    deltas = torch.sub(source, comp_x)
+    return deltas.cuda()
+
+def get_self_normalized(source):
+    pass
+
+def get_norm_from_deltas(src):
+    # first position is always (0,0,0)
+    # after that, values are added
+    return torch.cumsum(src, axis=0)
     
-    return src, target
-
 if __name__ == "__main__":
      # Parameters
     params = {'batch_size': 1,
             'shuffle': True,
-            'num_workers': 1}
-    max_epochs = 100
+            'num_workers': 3}
+    max_epochs = 20
 
     # grab the dataset
     full_dataset = MCS_Sequence_Dataset()
@@ -194,9 +195,12 @@ if __name__ == "__main__":
 
     # okay let's start training
     model = TransformerModel(3, 128, 8, 128, 2, 0.2).cuda()
-    criterion = nn.MSELoss()
-    # lr = 0.00001  # learning rate
-    lr = 0.01  # learning rate
+    
+    # TODO: try huber loss
+    criterion = nn.HuberLoss()
+
+    lr = 0.00001  # learning rate
+    # lr = 0.01  # learning rate
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.95)
 
@@ -208,15 +212,14 @@ if __name__ == "__main__":
         with torch.no_grad():
             for src, timesteps, scene_names, lengths in val_set:
                 optimizer.zero_grad()
-                src, target = mask_input(src, timesteps)
-
-                optimizer.zero_grad()
-
+                src = get_deltas(src) # get our deltas
+                # src, target, mask_idx = mask_input(src, timesteps) # mask some of the inputs
                 src_mask = generate_square_subsequent_mask(src.size(0)).cuda()
+                
                 output = model(src, src_mask)
-                outputs.append([src, output, target, scene_names, lengths])
-
-                loss = criterion(output.squeeze(0), target)
+                loss = criterion(output, src)
+                
+                outputs.append([src, output, scene_names, lengths])
                 losses.append(loss.item())
 
         return outputs[-1], losses
@@ -227,19 +230,18 @@ if __name__ == "__main__":
         log_interval = 200
         losses = []
 
-        # inline method for now?
+        # online method for now?
         i = 0
         for src, timesteps, scene_names, lengths in train_set:
             optimizer.zero_grad()
 
             # reshape and mask our src, create our target
-            src, target = mask_input(src, timesteps)
-
-            optimizer.zero_grad()
-
+            src = get_deltas(src)
+            src, target, mask_idx = mask_input(src, timesteps) # absolutes
             src_mask = generate_square_subsequent_mask(src.size(0)).cuda()
-            output = model(src, src_mask)
-            loss = criterion(output.squeeze(0), target)
+
+            output = model(src, target, src_mask)
+            loss = criterion(output, target[mask_idx])
             
             loss.backward()
             optimizer.step()
@@ -269,6 +271,9 @@ if __name__ == "__main__":
         avg_val_losses.append(np.mean(val_losses))
         val_outputs.append(val_trajectories)
 
+    # save model weights
+    torch.save(model.state_dict(), f"{max_epochs}_delta_mask_model.pth")
+
     fig = plt.figure(figsize=(12, 4))
 
     ax = fig.add_subplot(121)
@@ -276,31 +281,34 @@ if __name__ == "__main__":
     ax.plot(range(len(avg_train_losses)), avg_train_losses, label='Training Loss')
     ax.plot(range(len(avg_val_losses)), avg_val_losses, label='Validation Loss')
     ax.set_xlabel('Epochs')
-    ax.set_ylabel('MSE Loss')
+    ax.set_ylabel('Huber Loss')
     ax.legend()
 
     ax = fig.add_subplot(122, projection='3d')
+    val_outputs.reverse()
     for info in val_outputs:
-        src, output, target, name, length = info[0], info[1], info[2], info[3], info[4]
+        src, output, name, length = info[0], info[1], info[2], info[3]
         ax.set_title(name)
         # print("name", name)
         # print("length", length)
         # print(output)
 
+        # x = src[:, :, 0].reshape(-1).cpu().numpy()
+        # y = src[:, :, 1].reshape(-1).cpu().numpy()
+        # z = src[:, :, 2].reshape(-1).cpu().numpy()
+        # ax.scatter(x,y,z,c='red', label="source trajectory")
+
+        src = get_norm_from_deltas(src)
         x = src[:, :, 0].reshape(-1).cpu().numpy()
         y = src[:, :, 1].reshape(-1).cpu().numpy()
         z = src[:, :, 2].reshape(-1).cpu().numpy()
-        ax.plot(x,y,z,c='red', label="source trajectory")
+        ax.scatter(x,y,z,c='blue',label="target trajectory")
 
-        x = target[:, :, 0].reshape(-1).cpu().numpy()
-        y = target[:, :, 1].reshape(-1).cpu().numpy()
-        z = target[:, :, 2].reshape(-1).cpu().numpy()
-        ax.plot(x,y,z,c='blue',label="target trajectory")
-
+        output = get_norm_from_deltas(output)
         x = output[:, :, 0].reshape(-1).cpu().numpy()
         y = output[:, :, 1].reshape(-1).cpu().numpy()
         z = output[:, :, 2].reshape(-1).cpu().numpy()
-        ax.plot(x,y,z,c='green',label="output trajectory")
+        ax.scatter(x,y,z,c='green',label="output trajectory")
 
         break
 

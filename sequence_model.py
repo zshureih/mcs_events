@@ -1,48 +1,51 @@
 import math
-from typing import Tuple
-
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from torch.nn import TransformerEncoder, TransformerEncoderLayer, TransformerDecoder, TransformerDecoderLayer
 from torch.utils.data import dataset
-from TCN.TCN.tcn import TemporalConvNet as TCN
 
 class TransformerModel(nn.Module):
 
     def __init__(self, input_dim: int, d_model: int, nhead: int, d_hid: int,
                  nlayers: int, dropout: float = 0.5):
         super().__init__()
+
         self.model_type = 'Transformer'
         self.pos_encoder = PositionalEncoding(d_model, dropout)
         encoder_layers = TransformerEncoderLayer(d_model, nhead, d_hid, dropout)
         self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
         self.encoder = nn.Linear(input_dim, d_model)
         self.d_model = d_model
+
+        # TODO: try TransformerDecoderLayer
+        decoder_layers = TransformerDecoderLayer(d_model, nhead, d_hid, dropout)
+        self.transformer_decoder = TransformerDecoder(decoder_layers, nlayers)
         self.decoder = nn.Linear(d_model, input_dim)
 
         self.init_weights()
 
     def init_weights(self) -> None:
-        initrange = 0.5
+        initrange = 1.0
         self.encoder.weight.data.uniform_(-initrange, initrange)
         self.decoder.bias.data.zero_()
         self.decoder.weight.data.uniform_(-initrange, initrange)
 
-    def forward(self, src: Tensor, src_mask: Tensor) -> Tensor:
+    def forward(self, src: Tensor, target: Tensor, src_mask: Tensor) -> Tensor:
         """
         Args:
             src: Tensor, shape [seq_len, batch_size, 3]
             src_mask: Tensor, shape [seq_len, seq_len]
 
         Returns:
-            output Tensor of shape [seq_len, batch_size, ntoken]
+            output Tensor of shape [seq_len, batch_size, 3]
         """
 
         src = self.encoder(src)
         src = self.pos_encoder(src)
-        output = self.transformer_encoder(src, src_mask)
-        output = self.decoder(output)
+        e_output = self.transformer_encoder(src, src_mask)
+        d_output = self.transformer_decoder(target, e_output)
+        output = self.decoder(d_output)
 
         return output
 
