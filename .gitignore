@@ -131,3 +131,5 @@ dmypy.json
 # repo specific
 data/
 MCS_Eval_4*
+cube*
+*.pth
