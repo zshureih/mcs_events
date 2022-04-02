@@ -60,7 +60,6 @@ features = [
 def get_dataset():
     master_df = pd.DataFrame([], columns=features + ['scene_name'])
     
-    # randomly select 100 scenes
     scenes = np.array(listdir("data"))
 
     # go through each scene
@@ -153,7 +152,7 @@ def mask_input(src, timesteps, min_k=5):
     target = src.detach().clone() # make a copy of our source and label it as the target
 
     # now let's mask the input
-    # randomly select a k frame window to mask 
+    # randomly select a k frame window to mask
     init_index = np.random.randint(0, src.size(0) - min_k)
     masked_idx = range(init_index, init_index + min_k)
 
@@ -182,7 +181,7 @@ if __name__ == "__main__":
     params = {'batch_size': 1,
             'shuffle': True,
             'num_workers': 3}
-    max_epochs = 20
+    max_epochs = 200
 
     # grab the dataset
     full_dataset = MCS_Sequence_Dataset()
@@ -240,8 +239,8 @@ if __name__ == "__main__":
             src, target, mask_idx = mask_input(src, timesteps) # absolutes
             src_mask = generate_square_subsequent_mask(src.size(0)).cuda()
 
-            output = model(src, target, src_mask)
-            loss = criterion(output, target[mask_idx])
+            output = model(src, src_mask)
+            loss = criterion(output[mask_idx], target[mask_idx])
             
             loss.backward()
             optimizer.step()

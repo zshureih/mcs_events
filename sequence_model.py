@@ -19,8 +19,6 @@ class TransformerModel(nn.Module):
         self.d_model = d_model
 
         # TODO: try TransformerDecoderLayer
-        decoder_layers = TransformerDecoderLayer(d_model, nhead, d_hid, dropout)
-        self.transformer_decoder = TransformerDecoder(decoder_layers, nlayers)
         self.decoder = nn.Linear(d_model, input_dim)
 
         self.init_weights()
@@ -31,7 +29,7 @@ class TransformerModel(nn.Module):
         self.decoder.bias.data.zero_()
         self.decoder.weight.data.uniform_(-initrange, initrange)
 
-    def forward(self, src: Tensor, target: Tensor, src_mask: Tensor) -> Tensor:
+    def forward(self, src: Tensor, src_mask: Tensor) -> Tensor:
         """
         Args:
             src: Tensor, shape [seq_len, batch_size, 3]
@@ -44,8 +42,7 @@ class TransformerModel(nn.Module):
         src = self.encoder(src)
         src = self.pos_encoder(src)
         e_output = self.transformer_encoder(src, src_mask)
-        d_output = self.transformer_decoder(target, e_output)
-        output = self.decoder(d_output)
+        output = self.decoder(e_output)
 
         return output
 
