@@ -1,15 +1,16 @@
 import os
 import random
+from re import T
 import time
-
+import math
 import numpy as np
-
 import torch
-import torch.nn as nn, Tensor
+import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.autograd import Variable
+from torch import Tensor
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 from torch.utils.data import dataset
 
 class RelationalModel(nn.Module):
@@ -102,30 +103,42 @@ class MultiObjectModel(nn.Module):
     def init_weights(self) -> None:
         initrange = 0.1
         self.encoder.weight.data.uniform_(-initrange, initrange)
-        self.fc1.bias.data.zero_()
-        self.fc1.weight.data.uniform_(-initrange, initrange)
-        self.fc2.bias.data.zero_()
-        self.fc2.weight.data.uniform_(-initrange, initrange)
-        self.fc3.bias.data.zero_()
-        self.fc3.weight.data.uniform_(-initrange, initrange)
 
-    def forward(self, src: Tensor, src_mask: Tensor) -> Tensor:
+    def forward(self, src: Tensor, track_lengths: list, relation_info: tuple) -> Tensor:
         """
         Args:
-            src: Tensor, shape [n_objs, max_seq_len, batch_size, 3]
-            src_mask: Tensor, shape [seq_len, seq_len]
+            src: Tensor, shape [n_objs, max_seq_len, 4]
+            track_lengths: List, shape [seq_len, seq_len]
 
         Returns:
             output Tensor of shape [seq_len, batch_size, ntoken]
         """
-        src = self.encoder(src)
-        src = self.pos_encoder(src)
-        output = self.transformer_encoder(src, src_mask)
+        sender_relations = relation_info[0]
+        receiver_relations = relation_info[1]
+        relation_information = relation_info[2]
+
+        n = len(track_lengths)
+        traj_enc = [] # list of encoded sequences
+        for i in range(n):
+            x = pack_padded_sequence(
+                src[i].unsqueeze(1), 
+                [track_lengths[i]], 
+                batch_first=False, 
+                enforce_sorted=False
+            )
+
+            x = self.encoder(x.data.unsqueeze(1))
+            x = self.pos_encoder(x)
+            x_mask = generate_square_subsequent_mask(x.size(0)).cuda()
+            e_output = self.transformer_encoder(x, x_mask)
+            traj_enc.append(e_output[-1])
 
         # start classifying the output of the encoder
+        traj_enc = torch.stack(traj_enc, dim=0)
+        prediction = self.decoder(traj_enc.permute(1, 0, 2), sender_relations, receiver_relations, relation_information)
+        prediction = nn.AvgPool1d((prediction.shape[0]), stride=1)(prediction.permute(1,0)).squeeze(0)
 
-        # TODO: rather than pooling, classify the features of the final token/timestep in sequence
-        return output
+        return prediction
 
 def generate_square_subsequent_mask(sz: int) -> Tensor:
     """Generates an upper-triangular matrix of -inf, with zeros on diag."""
